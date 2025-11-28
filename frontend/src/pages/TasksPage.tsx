@@ -264,20 +264,9 @@ export default function TasksPage() {
         {filteredTasks.length === 0 ? (
           <Card className="border-border shadow-sm">
             <CardContent className="p-12 text-center">
-              {tasks.length === 0 ? (
-                <div>
-                  <p className="text-muted-foreground mb-4">No tasks found</p>
-                  <p className="text-sm text-muted-foreground mb-4">
-                    Make sure your backend server is running on http://localhost:5000
-                  </p>
-                  <Button onClick={handleRetry} className="gap-2">
-                    <RefreshCw size={16} />
-                    Retry Connection
-                  </Button>
-                </div>
-              ) : (
+              
                 <p className="text-muted-foreground">No tasks match your filters.</p>
-              )}
+              
             </CardContent>
           </Card>
         ) : (
