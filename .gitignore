@@ -1,0 +1,47 @@
+# ==========================================
+# GENERAL
+# ==========================================
+node_modules/
+.env
+.env.local
+.env.*.local
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-store/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# ==========================================
+# BACKEND
+# ==========================================
+backend/node_modules/
+backend/.env
+backend/package-lock.json
+backend/*.log
+
+# Ignore uploads/temp if you use them
+backend/uploads/
+backend/tmp/
+
+# ==========================================
+# FRONTEND (React/Vite)
+# ==========================================
+frontend/node_modules/
+frontend/.env
+frontend/.env.local
+frontend/dist/
+frontend/build/
+frontend/.vite/
+frontend/*.log
+
+# ==========================================
+# IDE / EDITOR
+# ==========================================
+.vscode/
+.idea/
+*.swp
+*.swo
