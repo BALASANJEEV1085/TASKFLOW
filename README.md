@@ -16,11 +16,15 @@ A simple web application with authentication and task management.
 
 ### Backend
 cd backend
+
 npm install
+
 npm start
 
 
 ### Frontend
 cd frontend
+
 npm install
+
 npm run dev
