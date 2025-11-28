@@ -21,7 +21,7 @@ app.use((req, res, next) => {
   next();
 });
 
-const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://bala:bala@notescluster.juud6hu.mongodb.net/taskmanager?retryWrites=true&w=majority';
+const MONGODB_URI = process.env.MONGODB_URI ;
 
 console.log(' Attempting to connect to MongoDB...');
 
