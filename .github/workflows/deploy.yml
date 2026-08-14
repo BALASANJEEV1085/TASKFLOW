@@ -1,0 +1,103 @@
+name: Build & Deploy to EC2 Docker
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY: taskflow
+  INSTANCE_ID: i-017c45b843caa3b7d
+
+jobs:
+  deploy:
+    name: Build, Push and Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-south-1
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push Docker image to ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          set -e
+          FULL_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY"
+          echo "Building $FULL_IMAGE:latest"
+          docker build --tag "$FULL_IMAGE:$GITHUB_SHA" --tag "$FULL_IMAGE:latest" .
+          docker push "$FULL_IMAGE:$GITHUB_SHA"
+          docker push "$FULL_IMAGE:latest"
+          echo "full_image=$FULL_IMAGE" >> $GITHUB_OUTPUT
+
+      - name: Deploy to EC2 via SSM
+        if: ${{ env.INSTANCE_ID != '' }}
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          python3 - << 'PYEOF'
+          import subprocess, sys, json, time, os
+          region = "ap-south-1"
+          instance_id = "i-017c45b843caa3b7d"
+          ecr_registry = os.environ.get("ECR_REGISTRY", "696434672023.dkr.ecr.ap-south-1.amazonaws.com")
+          repo = "taskflow"
+          secret_id = "deptic/TASKFLOW/secrets"
+          image = ecr_registry + "/" + repo + ":latest"
+
+          def aws(*args):
+              r = subprocess.run(["aws"] + list(args), capture_output=True, text=True)
+              return r.returncode, r.stdout.strip(), r.stderr.strip()
+
+          print("==> Waiting for SSM agent...")
+          for i in range(30):
+              _, ping, _ = aws("ssm", "describe-instance-information",
+                  "--region", region,
+                  "--filters", "Key=InstanceIds,Values=" + instance_id,
+                  "--query", "InstanceInformationList[0].PingStatus",
+                  "--output", "text")
+              print("SSM ping:", ping, "(" + str(i+1) + "/30)")
+              if ping == "Online":
+                  break
+              time.sleep(10)
+
+          commands = [
+              "systemctl start docker 2>/dev/null || service docker start 2>/dev/null || true",
+              "until docker info > /dev/null 2>&1; do echo waiting; sleep 3; done",
+              "aws ecr get-login-password --region " + region + " | docker login --username AWS --password-stdin " + ecr_registry,
+              "docker pull " + image,
+              "docker stop app 2>/dev/null || true",
+              "docker rm app 2>/dev/null || true",
+              "aws secretsmanager get-secret-value --region " + region + " --secret-id " + secret_id + " --query SecretString --output text | python3 -c 'import sys,json; d=json.load(sys.stdin); [print(k+chr(61)+v) for k,v in d.items()]' > /home/ubuntu/app.env 2>/dev/null || touch /home/ubuntu/app.env",
+              "docker run -d --restart always -p 80:3000 --env-file /home/ubuntu/app.env --name app " + image,
+          ]
+          cli = json.dumps(dict(DocumentName="AWS-RunShellScript", InstanceIds=[instance_id], Parameters=dict(commands=commands)))
+          rc, cmd_id, err = aws("ssm", "send-command", "--region", region, "--cli-input-json", cli, "--query", "Command.CommandId", "--output", "text")
+          if rc != 0:
+              print("send-command failed:", err); sys.exit(1)
+          print("SSM CommandId:", cmd_id)
+
+          for i in range(36):
+              time.sleep(5)
+              _, status, _ = aws("ssm", "get-command-invocation", "--region", region, "--command-id", cmd_id, "--instance-id", instance_id, "--query", "Status", "--output", "text")
+              status = status or "Pending"
+              print("Status [" + str(i+1) + "/36]:", status)
+              if status == "Success":
+                  print("Deployment succeeded!"); sys.exit(0)
+              if status in ("Failed", "Cancelled", "TimedOut"):
+                  _, serr, _ = aws("ssm", "get-command-invocation", "--region", region, "--command-id", cmd_id, "--instance-id", instance_id, "--query", "StandardErrorContent", "--output", "text")
+                  print("STDERR:", serr); sys.exit(1)
+          print("Timeout"); sys.exit(1)
+          PYEOF
