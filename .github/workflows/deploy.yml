@@ -46,7 +46,7 @@ jobs:
       - name: Build, tag, and push Docker image to ECR
         id: build-image
         run: |
-          FULL_IMAGE="${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}"
+          FULL_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY"
           IMAGE_TAG="${{ github.sha }}"
           echo "Building $FULL_IMAGE:latest from context ."
           docker build \
@@ -60,7 +60,7 @@ jobs:
 
       - name: Verify Docker image (build diagnostics)
         run: |
-          FULL_IMAGE="${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}"
+          FULL_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}"
           echo "### Image verification ###"
           docker run --rm --entrypoint sh "$FULL_IMAGE" -c "
             echo 'Image built successfully';
@@ -90,16 +90,13 @@ jobs:
             if [ -n "$RESOLVED_ID" ] && [ "$RESOLVED_ID" != "None" ]; then
               INSTANCE_ID="$RESOLVED_ID"
               echo "Resolved running instance: $INSTANCE_ID"
-            else
-              echo "ERROR: No running EC2 instance found for deployment"
-              exit 1
             fi
-          else
-            echo "Target instance $INSTANCE_ID is running"
           fi
 
-          # Build SSM command parameters using file to avoid shell parsing issues
-          mkdir -p /tmp
+          echo "Deploying to instance: $INSTANCE_ID"
+          echo "Image URI: $IMAGE_URI"
+
+          # Send SSM command to deploy
           cat > /tmp/ssm-params.json << 'SSMPARAMS'
           {
             "commands": [
@@ -112,10 +109,11 @@ jobs:
           }
           SSMPARAMS
 
-          # Substitute variables in the JSON file
-          sed -i "s|\$REGION|$REGION|g; s|\$ECR_REGISTRY|$ECR_REGISTRY|g; s|\$IMAGE_URI|$IMAGE_URI|g" /tmp/ssm-params.json
+          # Replace variables inside the JSON
+          sed -i "s|\$REGION|$REGION|g" /tmp/ssm-params.json
+          sed -i "s|\$ECR_REGISTRY|$ECR_REGISTRY|g" /tmp/ssm-params.json
+          sed -i "s|\$IMAGE_URI|$IMAGE_URI|g" /tmp/ssm-params.json
 
-          echo "### Sending SSM command to deploy ###"
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "$INSTANCE_ID" \
             --region "$REGION" \
@@ -125,78 +123,28 @@ jobs:
             --output text)
 
           echo "SSM Command ID: $COMMAND_ID"
-          echo "command_id=$COMMAND_ID" >> "$GITHUB_OUTPUT"
 
           # Wait for command to complete
-          echo "Waiting for SSM command to complete..."
           sleep 30
 
-          # Check command status
-          COMMAND_STATUS=$(aws ssm list-command-invocations \
-            --command-id "$COMMAND_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --region "$REGION" \
-            --query "CommandInvocations[0].Status" \
-            --output text 2>/dev/null || echo "Unknown")
-          
-          echo "SSM Command Status: $COMMAND_STATUS"
-          
-          # Show command output if available
+          # Get command output
           aws ssm get-command-invocation \
             --command-id "$COMMAND_ID" \
             --instance-id "$INSTANCE_ID" \
             --region "$REGION" \
-            --query "StandardOutputContent" \
-            --output text 2>/dev/null || echo "No stdout output available"
-
-          if [ "$COMMAND_STATUS" != "Success" ]; then
-            echo "WARNING: SSM command may not have completed successfully (status: $COMMAND_STATUS)"
-            # Continue to health check anyway
-          fi
+            --query "Status" \
+            --output text
 
       - name: Health check
         run: |
-          PUBLIC_URL="${{ env.PUBLIC_URL }}"
-          MAX_RETRIES=12
-          RETRY_DELAY=10
-          RETRY_COUNT=0
-
-          echo "Performing health check on $PUBLIC_URL/api/health"
-
-          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-            RETRY_COUNT=$((RETRY_COUNT + 1))
-            echo "Attempt $RETRY_COUNT of $MAX_RETRIES..."
-            
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 10 --max-time 15 "$PUBLIC_URL/api/health" 2>/dev/null || echo "000")
-            
-            if [ "$HTTP_CODE" = "200" ]; then
-              echo "Health check passed!"
-              echo "Application is running at $PUBLIC_URL"
-              
-              # Get health check response body for additional verification
-              RESPONSE=$(curl -s --connect-timeout 10 --max-time 15 "$PUBLIC_URL/api/health" 2>/dev/null || echo "")
-              echo "Health endpoint response: $RESPONSE"
-              
-              exit 0
-            else
-              echo "Health check failed with HTTP status: $HTTP_CODE"
-              if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
-                echo "Retrying in $RETRY_DELAY seconds..."
-                sleep $RETRY_DELAY
-              fi
-            fi
-          done
-
-          echo "Health check failed after $MAX_RETRIES attempts"
-          exit 1
-
-      - name: Deployment Summary
-        if: always()
-        run: |
-          echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
-          echo "**Repository:** ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Commit SHA:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
-          echo "**ECR Image:** ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
-          echo "**EC2 Instance:** ${{ env.INSTANCE_ID }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Application URL:** ${{ env.PUBLIC_URL }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Status:** ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "Waiting for application to be ready..."
+          sleep 15
+          STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "${{ env.PUBLIC_URL }}/api/health" || echo "000")
+          if [ "$STATUS_CODE" = "200" ]; then
+            echo "Health check passed! Application is running at ${{ env.PUBLIC_URL }}"
+          else
+            echo "Health check failed with status code: $STATUS_CODE"
+            echo "Checking if instance is accessible..."
+            curl -v --max-time 30 "${{ env.PUBLIC_URL }}" || echo "Instance not reachable"
+            exit 1
+          fi
