@@ -9,10 +9,8 @@ env:
   AWS_REGION: ap-south-1
   ECR_REPOSITORY: taskflow
   INSTANCE_ID: i-00cece76df20c1e36
-  SERVER_NAME: taskflow-server
-  PUBLIC_IP: 3.109.24.233
-  TARGET_PORT: 80
-  DOCKERFILE_PATH: .
+  AWS_ACCOUNT_ID: "759204735992"
+  TARGET_PORT: "80"
 
 jobs:
   deploy:
@@ -21,8 +19,7 @@ jobs:
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION }}
-      AWS_REGION: ${{ secrets.AWS_REGION }}
+      AWS_DEFAULT_REGION: ap-south-1
 
     steps:
       - name: Checkout repository
@@ -32,177 +29,130 @@ jobs:
         id: login-ecr
         run: |
           set -e
-          # Direct AWS CLI ECR login - no action, no OIDC
-          aws ecr get-login-password --region ${ env.AWS_REGION } | docker login --username AWS --password-stdin ${ secrets.AWS_ACCOUNT_ID }.dkr.ecr.${ env.AWS_REGION }.amazonaws.com
-          echo "registry=${ secrets.AWS_ACCOUNT_ID }.dkr.ecr.${ env.AWS_REGION }.amazonaws.com" >> $GITHUB_OUTPUT
+          aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_DEFAULT_REGION }}.amazonaws.com
 
       - name: Build, tag, and push Docker image to ECR
         id: build-image
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         run: |
           set -e
-          FULL_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY"
-          echo "Building $FULL_IMAGE:latest from context: ."
+          FULL_IMAGE="${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_DEFAULT_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}"
+          echo "Building $FULL_IMAGE:latest from context: ${{ env.DOCKERFILE_PATH || '.' }}"
           docker build --tag "$FULL_IMAGE:$GITHUB_SHA" --tag "$FULL_IMAGE:latest" .
           docker push "$FULL_IMAGE:$GITHUB_SHA"
           docker push "$FULL_IMAGE:latest"
           echo "full_image=$FULL_IMAGE" >> "$GITHUB_OUTPUT"
+          echo "image_uri=$FULL_IMAGE:latest" >> "$GITHUB_OUTPUT"
 
       - name: Deploy to EC2 via SSM
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION }}
         run: |
           set -e
-          # Explicitly export AWS credentials for AWS CLI in this step
-          export AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID"
-          export AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY"
-          export AWS_DEFAULT_REGION="$AWS_DEFAULT_REGION"
-          export AWS_REGION="$AWS_DEFAULT_REGION"
-          # Use literal env vars from workflow/job env (no ${ env.VAR } here!)
-          AWS_REGION="$AWS_REGION"
-          INSTANCE_ID="$INSTANCE_ID"
-          SERVER_NAME="$SERVER_NAME"
-          ECR_REGISTRY="${ECR_REGISTRY:-759204735992.dkr.ecr.ap-south-1.amazonaws.com}"
-          REPO="taskflow"
-          SECRET_ID="deptic/TASKFLOW/secrets"
-          FULL_IMAGE="$ECR_REGISTRY/$REPO:latest"
-          TARGET_PORT="$TARGET_PORT"
+          REGION="${{ env.AWS_DEFAULT_REGION }}"
+          INSTANCE_ID="${{ env.INSTANCE_ID }}"
+          ECR_REGISTRY="${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_DEFAULT_REGION }}.amazonaws.com"
+          REPO="${{ env.ECR_REPOSITORY }}"
+          IMAGE_URI="$ECR_REGISTRY/$REPO:latest"
+          TARGET_PORT="${{ env.TARGET_PORT }}"
 
-          # Dynamic resolution: If INSTANCE_ID is missing or stopped, locate active instance by tag
-          if [ -z "$INSTANCE_ID" ] || ! aws ec2 describe-instances --region "$AWS_REGION" --instance-ids "$INSTANCE_ID" --query "Reservations[0].Instances[0].State.Name" --output text 2>/dev/null | grep -q "running"; then
-            echo "==> Resolving active EC2 instance by tag Name=$SERVER_NAME..."
-            RESOLVED_ID=$(aws ec2 describe-instances --region "$AWS_REGION" \
-              --filters "Name=tag:Name,Values=$SERVER_NAME" "Name=instance-state-name,Values=running" \
-              --query "Reservations[0].Instances[0].InstanceId" --output text 2>/dev/null || true)
+          # Resolve active instance if the hardcoded one is not running
+          INSTANCE_STATE=$(aws ec2 describe-instances --region "$REGION" --instance-ids "$INSTANCE_ID" --query "Reservations[0].Instances[0].State.Name" --output text 2>/dev/null || echo "stopped")
+          if [ "$INSTANCE_STATE" != "running" ]; then
+            echo "Instance $INSTANCE_ID not running. Attempting to resolve by tag..."
+            RESOLVED_ID=$(aws ec2 describe-instances --region "$REGION" --filters "Name=tag:Name,Values=taskflow-server" "Name=instance-state-name,Values=running" --query "Reservations[0].Instances[0].InstanceId" --output text 2>/dev/null || true)
             if [ -n "$RESOLVED_ID" ] && [ "$RESOLVED_ID" != "None" ]; then
-              echo "==> Found running instance: $RESOLVED_ID"
               INSTANCE_ID="$RESOLVED_ID"
+              echo "Resolved to running instance: $INSTANCE_ID"
+            else
+              echo "ERROR: No running instance found. Aborting deployment."
+              exit 1
             fi
           fi
 
-          if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
-            echo "==> ERROR: No running EC2 instance found for $SERVER_NAME in $AWS_REGION."
-            exit 1
-          fi
+          # Get secrets from AWS Secrets Manager
+          SECRET_JSON=$(aws secretsmanager get-secret-value --secret-id "deptic/TASKFLOW/secrets" --region "$REGION" --query SecretString --output text 2>/dev/null || echo '{}')
+          MONGODB_URI=$(echo "$SECRET_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('MONGODB_URI', ''))" 2>/dev/null || echo "")
+          JWT_SECRET=$(echo "$SECRET_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('JWT_SECRET', ''))" 2>/dev/null || echo "")
 
-          echo "==> Waiting for SSM agent on instance $INSTANCE_ID in $AWS_REGION..."
-          PING="Offline"
-          for i in $(seq 1 36); do
-            PING=$(aws ssm describe-instance-information \
-              --region "$AWS_REGION" \
-              --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
-              --query "InstanceInformationList[0].PingStatus" \
-              --output text 2>/dev/null || true)
-            echo "SSM Ping [$i/36]: $PING"
-            if [ "$PING" = "Online" ]; then
-              break
-            fi
-            sleep 10
-          done
-
-          if [ "$PING" != "Online" ]; then
-            echo "==> SSM agent is not Online (status: $PING). Checking if instance is still booting..."
-            aws ec2 describe-instances --region "$AWS_REGION" --instance-ids "$INSTANCE_ID" --query "Reservations[0].Instances[0].State.Name" --output text 2>/dev/null || true
-            echo "==> Aborting deploy due to SSM agent unreachable."
-            exit 1
-          fi
-
-          # Write the SSM command payload to a JSON file — this avoids
-          # ALL shell quoting issues from embedding a JSON array of
-          # double-quoted strings inside a double-quoted CLI argument.
-          cat > /tmp/ssm-params.json << SSMPARAMS
+          # Write SSM command payload to file
+          cat > /tmp/ssm-params.json << 'SSMPARAMS'
           {
             "commands": [
-              "echo '==> Synchronizing cloud-init provisioning...' && (cloud-init status --wait 2>/dev/null || true)",
-              "systemctl start docker 2>/dev/null || service docker start 2>/dev/null || true",
-              "until docker info > /dev/null 2>&1; do sleep 2; done",
-              "aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY",
-              "docker pull $FULL_IMAGE",
-              "docker stop app 2>/dev/null || true",
-              "docker rm app 2>/dev/null || true",
-              "aws secretsmanager get-secret-value --region $AWS_REGION --secret-id $SECRET_ID --query SecretString --output text | python3 -c \"import sys,json; [print(k, v, sep=chr(61)) for k, v in json.load(sys.stdin).items()]\" > /home/ubuntu/app.env 2>/dev/null || touch /home/ubuntu/app.env",
-              "# Determine container port from image metadata or use TARGET_PORT",
-              "CONTAINER_PORT=$(docker inspect $FULL_IMAGE --format '{{json .Config.ExposedPorts}}' 2>/dev/null | python3 -c \"import sys,json; d=json.load(sys.stdin); print(list(d.keys())[0].split('/')[0]) if d else '$TARGET_PORT'\" 2>/dev/null || echo $TARGET_PORT)",
-              "echo "==> Container exposes port: $CONTAINER_PORT"",
-              "docker run -d --restart always -p 80:$CONTAINER_PORT -e HOSTNAME=0.0.0.0 --env-file /home/ubuntu/app.env --name app $FULL_IMAGE",
-              "sleep 5",
-              "echo "==> Verifying container is running..."",
-              "docker ps --filter name=app --format 'table {{.Names}}	{{.Status}}	{{.Ports}}'",
-              "echo "==> Testing container health internally..."",
-              "for i in $(seq 1 10); do sleep 3; if curl -sf http://localhost:$CONTAINER_PORT/ >/dev/null 2>&1 || curl -sf http://localhost:$CONTAINER_PORT/health >/dev/null 2>&1; then echo "==> Container health check PASSED on port $CONTAINER_PORT"; break; fi; done",
-              "echo "==> Final container status:"",
-              "docker ps --filter name=app --format 'table {{.Names}}	{{.Status}}	{{.Ports}}'"
+              "export AWS_DEFAULT_REGION=ap-south-1",
+              "aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin 759204735992.dkr.ecr.ap-south-1.amazonaws.com",
+              "docker pull 759204735992.dkr.ecr.ap-south-1.amazonaws.com/taskflow:latest",
+              "docker stop app || true",
+              "docker rm app || true",
+              "docker run -d --restart always -p 80:80 --name app -e MONGODB_URI='$MONGODB_URI' -e JWT_SECRET='$JWT_SECRET' 759204735992.dkr.ecr.ap-south-1.amazonaws.com/taskflow:latest"
             ]
           }
           SSMPARAMS
 
-          echo "==> Sending SSM deployment command to instance $INSTANCE_ID..."
-          CMD_ID=$(aws ssm send-command \
-            --region "$AWS_REGION" \
+          # Substitute secrets using Python to avoid shell escaping issues
+          python3 << 'PYTHON_SCRIPT'
+          import json, os
+
+          with open('/tmp/ssm-params.json', 'r') as f:
+              params = json.load(f)
+
+          mongodb_uri = os.environ.get('MONGODB_URI', '')
+          jwt_secret = os.environ.get('JWT_SECRET', '')
+
+          # Replace placeholders in the commands
+          for i, cmd in enumerate(params['commands']):
+              params['commands'][i] = cmd.replace('$MONGODB_URI', mongodb_uri).replace('$JWT_SECRET', jwt_secret)
+
+          with open('/tmp/ssm-params.json', 'w') as f:
+              json.dump(params, f)
+
+          print("SSM parameters written successfully")
+          PYTHON_SCRIPT
+
+          # Send command to EC2
+          COMMAND_ID=$(aws ssm send-command \
             --instance-ids "$INSTANCE_ID" \
+            --region "$REGION" \
             --document-name "AWS-RunShellScript" \
             --parameters file:///tmp/ssm-params.json \
             --query "Command.CommandId" \
             --output text)
-          echo "SSM CommandId: $CMD_ID"
 
-          echo "==> Polling command status..."
-          for i in $(seq 1 36); do
-            sleep 5
-            STATUS=$(aws ssm get-command-invocation \
-              --region "$AWS_REGION" \
-              --command-id "$CMD_ID" \
-              --instance-id "$INSTANCE_ID" \
-              --query "Status" \
-              --output text 2>/dev/null || true)
-            echo "Status [$i/36]: $STATUS"
-            if [ "$STATUS" = "Success" ]; then
-              echo "==> Deployment successfully finished on instance!"
-              exit 0
-            fi
-            if [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "TimedOut" ]; then
-              echo "==> SSM Command Failed!"
-              aws ssm get-command-invocation \
-                --region "$AWS_REGION" \
-                --command-id "$CMD_ID" \
-                --instance-id "$INSTANCE_ID" \
-                --query "StandardErrorContent" \
-                --output text 2>/dev/null || true
-              exit 1
-            fi
-          done
-          echo "==> Timed out waiting for SSM command execution."
-          exit 1
+          echo "SSM command sent: $COMMAND_ID"
 
-      - name: Verify Live Application Health
+          # Wait for SSM command to complete
+          echo "Waiting for SSM command to complete..."
+          sleep 30
+
+          # Get command output
+          aws ssm list-command-invocations \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --region "$REGION" \
+            --details \
+            --query "CommandInvocations[0].CommandPlugins[0].Output" \
+            --output text
+
+          echo "Deployment command executed successfully"
+
+      - name: Verify deployment health
         run: |
-          echo "==> Verifying live service health on public endpoint..."
-          # Use literal env vars from workflow env (no ${ env.VAR } in job env block!)
-          PROBE_HOST="$${PUBLIC_IP:-3.109.24.233}"
-          TARGET_PORT="$${TARGET_PORT:-80}"
-          if [ -z "$PROBE_HOST" ] || [ "$PROBE_HOST" = "None" ]; then
-            echo "==> No public IP or domain configured; skipping external HTTP probe."
-            exit 0
-          fi
-
-          echo "==> Probing http://$PROBE_HOST/ (host port 80)..."
-          # Longer retries: 30 attempts × 10s = 5 minutes for full container startup
-          for h in $(seq 1 30); do
-            sleep 10
-            # Try both root and /health paths like internal check
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "http://$PROBE_HOST/" 2>/dev/null || true)
-            if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "301" ] && [ "$HTTP_CODE" != "302" ]; then
-              HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "http://$PROBE_HOST/health" 2>/dev/null || true)
-            fi
-            echo "Health probe [$h/30]: HTTP $HTTP_CODE"
-            if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "301" ] || [ "$HTTP_CODE" = "302" ]; then
-              echo "==> Live health check PASSED (HTTP $HTTP_CODE) at http://$PROBE_HOST/"
+          set -e
+          PUBLIC_IP="3.109.24.233"
+          HEALTH_URL="http://$PUBLIC_IP/api/health"
+          echo "Checking health endpoint: $HEALTH_URL"
+          MAX_RETRIES=12
+          RETRY_DELAY=10
+          for i in $(seq 1 $MAX_RETRIES); do
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 10 "$HEALTH_URL" 2>/dev/null || echo "000")
+            if [ "$HTTP_STATUS" -eq 200 ]; then
+              echo "Health check passed! (HTTP $HTTP_STATUS) on attempt $i"
+              curl -s "$HEALTH_URL" | python3 -m json.tool || true
               exit 0
+            elif [ "$HTTP_STATUS" -eq 000 ]; then
+              echo "Attempt $i/$MAX_RETRIES: Server not reachable yet, retrying in ${RETRY_DELAY}s..."
+            else
+              echo "Attempt $i/$MAX_RETRIES: HTTP $HTTP_STATUS, retrying in ${RETRY_DELAY}s..."
             fi
+            sleep $RETRY_DELAY
           done
-          echo "==> Live health check FAILED after 5 minutes. Last HTTP code: $HTTP_CODE"
+          echo "ERROR: Health check failed after $MAX_RETRIES attempts"
+          curl -v "$HEALTH_URL" 2>&1 || true
           exit 1
