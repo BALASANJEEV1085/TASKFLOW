@@ -1,0 +1,215 @@
+name: Build and Deploy TaskFlow to EC2/Docker
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REGISTRY: 759204735992.dkr.ecr.ap-south-1.amazonaws.com
+  ECR_REPOSITORY: taskflow
+  INSTANCE_ID: i-00cece76df20c1e36
+  PUBLIC_URL: http://3.109.24.233
+  DETECTED_PORT: 5000
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Build diagnostics
+        run: |
+          echo "=== Repository Structure ==="
+          ls -la
+          echo "=== Backend package.json ==="
+          cat backend/package.json
+          echo "=== Frontend package.json ==="
+          cat frontend/package.json
+          echo "=== Server entry point ==="
+          head -20 backend/server.js
+          echo "=== Dockerfile check ==="
+          if [ -f Dockerfile ]; then echo "Dockerfile exists"; else echo "WARNING: No Dockerfile found at root"; fi
+
+      - name: Configure AWS credentials
+        run: |
+          mkdir -p ~/.aws
+          cat > ~/.aws/credentials << 'AWSCONFIG'
+          [default]
+          aws_access_key_id = ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws_secret_access_key = ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          region = ${{ env.AWS_REGION }}
+          AWSCONFIG
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        run: |
+          aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ env.ECR_REGISTRY }}
+          echo "Logged in to ECR successfully"
+
+      - name: Build and tag Docker image
+        id: build-image
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          IMAGE_TAG="latest-${SHORT_SHA}-$(date +%s)"
+          FULL_IMAGE_URI="${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${IMAGE_TAG}"
+          
+          docker build \
+            --build-arg NODE_ENV=production \
+            --build-arg PORT=${{ env.DETECTED_PORT }} \
+            -t $FULL_IMAGE_URI .
+          
+          echo "Image built: ${FULL_IMAGE_URI}"
+          echo "image_uri=${FULL_IMAGE_URI}" >> $GITHUB_OUTPUT
+
+      - name: Push Docker image to ECR
+        run: |
+          IMAGE_URI="${{ steps.build-image.outputs.image_uri }}"
+          docker push "${IMAGE_URI}"
+          echo "Image pushed: ${IMAGE_URI}"
+
+      - name: Retrieve secrets from AWS Secrets Manager
+        id: get-secrets
+        run: |
+          SECRET_JSON=$(aws secretsmanager get-secret-value \
+            --secret-id deptic/TASKFLOW/secrets \
+            --region ${{ env.AWS_REGION }} \
+            --query SecretString \
+            --output text)
+          
+          echo "Secrets retrieved successfully"
+          echo "secret_json=${SECRET_JSON}" >> $GITHUB_OUTPUT
+
+      - name: Prepare SSM deployment parameters
+        id: ssm-params
+        run: |
+          IMAGE_URI="${{ steps.build-image.outputs.image_uri }}"
+          REGION="${{ env.AWS_REGION }}"
+          INSTANCE_ID="${{ env.INSTANCE_ID }}"
+          SECRETS_JSON='${{ steps.get-secrets.outputs.secret_json }}'
+          
+          FRONTEND_PORT=$(echo "$SECRETS_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('FRONTEND_PORT','3000'))")
+          JWT_SECRET=$(echo "$SECRETS_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('JWT_SECRET',''))")
+          MONGODB_URI=$(echo "$SECRETS_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('MONGODB_URI',''))")
+          
+          cat > /tmp/ssm-params.json << 'SSMPARAMS'
+          {
+            "commands": [
+              "aws ecr get-login-password --region REGION_PLACEHOLDER | docker login --username AWS --password-stdin ECR_REGISTRY_PLACEHOLDER",
+              "docker pull IMAGE_URI_PLACEHOLDER",
+              "docker stop taskflow-app || true",
+              "docker rm taskflow-app || true",
+              "docker run -d --restart always -p DETECTED_PORT_PLACEHOLDER:DETECTED_PORT_PLACEHOLDER --name taskflow-app -e FRONTEND_PORT=FRONTEND_PORT_PLACEHOLDER -e JWT_SECRET=JWT_SECRET_PLACEHOLDER -e MONGODB_URI=MONGODB_URI_PLACEHOLDER IMAGE_URI_PLACEHOLDER",
+              "docker system prune -f || true"
+            ]
+          }
+          SSMPARAMS
+          
+          sed -i "s|REGION_PLACEHOLDER|${REGION}|g" /tmp/ssm-params.json
+          sed -i "s|ECR_REGISTRY_PLACEHOLDER|${{ env.ECR_REGISTRY }}|g" /tmp/ssm-params.json
+          sed -i "s|IMAGE_URI_PLACEHOLDER|${IMAGE_URI}|g" /tmp/ssm-params.json
+          sed -i "s|DETECTED_PORT_PLACEHOLDER|${{ env.DETECTED_PORT }}|g" /tmp/ssm-params.json
+          sed -i "s|FRONTEND_PORT_PLACEHOLDER|${FRONTEND_PORT}|g" /tmp/ssm-params.json
+          sed -i "s|JWT_SECRET_PLACEHOLDER|${JWT_SECRET}|g" /tmp/ssm-params.json
+          sed -i "s|MONGODB_URI_PLACEHOLDER|${MONGODB_URI}|g" /tmp/ssm-params.json
+          
+          echo "SSM parameters prepared"
+          cat /tmp/ssm-params.json
+
+      - name: Send deployment commands via SSM
+        id: ssm-send
+        env:
+          REGION: ${{ env.AWS_REGION }}
+          INSTANCE_ID: ${{ env.INSTANCE_ID }}
+        run: |
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --region "$REGION" \
+            --document-name "AWS-RunShellScript" \
+            --parameters file:///tmp/ssm-params.json \
+            --query "Command.CommandId" \
+            --output text)
+          
+          echo "Command sent: ${COMMAND_ID}"
+          echo "command_id=${COMMAND_ID}" >> $GITHUB_OUTPUT
+
+      - name: Wait for SSM command to complete
+        id: ssm-wait
+        env:
+          REGION: ${{ env.AWS_REGION }}
+          COMMAND_ID: ${{ steps.ssm-send.outputs.command_id }}
+          INSTANCE_ID: ${{ env.INSTANCE_ID }}
+        run: |
+          echo "Waiting for SSM command to complete..."
+          for i in $(seq 1 30); do
+            STATUS=$(aws ssm list-command-invocations \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --region "$REGION" \
+              --details \
+              --query "CommandInvocations[0].Status" \
+              --output text)
+            
+            if [ "$STATUS" = "Success" ]; then
+              echo "Command completed successfully"
+              break
+            elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "TimedOut" ]; then
+              echo "Command failed with status: ${STATUS}"
+              aws ssm list-command-invocations \
+                --command-id "$COMMAND_ID" \
+                --instance-id "$INSTANCE_ID" \
+                --region "$REGION" \
+                --details \
+                --query "CommandInvocations[0].CommandPlugins[0].Output" \
+                --output text
+              exit 1
+            fi
+            
+            sleep 10
+          done
+
+      - name: Health check - wait for service to be ready
+        id: health-check
+        env:
+          HEALTH_URL: ${{ env.PUBLIC_URL }}:${{ env.DETECTED_PORT }}/api/health
+        run: |
+          echo "Performing health check against: ${HEALTH_URL}"
+          
+          for i in $(seq 1 12); do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 10 "${HEALTH_URL}" || echo "000")
+            
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "Health check passed! HTTP 200"
+              RESPONSE=$(curl -s "${HEALTH_URL}")
+              echo "Response: ${RESPONSE}"
+              exit 0
+            else
+              echo "Attempt ${i}/12: HTTP status ${HTTP_CODE} - retrying in 10 seconds..."
+              sleep 10
+            fi
+          done
+          
+          echo "Health check failed after 12 attempts"
+          exit 1
+
+      - name: Final verification
+        run: |
+          echo "=== Deployment Summary ==="
+          echo "ECR Image: ${{ steps.build-image.outputs.image_uri }}"
+          echo "Instance: ${{ env.INSTANCE_ID }}"
+          echo "Public URL: ${{ env.PUBLIC_URL }}"
+          echo "Port: ${{ env.DETECTED_PORT }}"
+          echo "Region: ${{ env.AWS_REGION }}"
+          echo "Health endpoint: ${PUBLIC_URL}:${DETECTED_PORT}/api/health"
+          echo "Deployment completed successfully!"
