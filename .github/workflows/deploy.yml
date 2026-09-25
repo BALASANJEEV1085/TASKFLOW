@@ -1,8 +1,9 @@
-name: Build & Deploy to EC2 Docker
+name: Build, Deploy & Verify to EC2 Docker
 
 on:
   push:
-    branches: ["main"]
+    branches:
+      - main
   workflow_dispatch:
 
 env:
@@ -13,15 +14,15 @@ env:
   PUBLIC_URL: http://35.154.173.36
 
 jobs:
-  deploy:
-    name: Build, Push and Deploy
+  build-and-deploy:
+    name: Build, Push, Deploy, and Verify
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Configure AWS CLI
+      - name: Configure AWS CLI credentials
         run: |
           mkdir -p ~/.aws
           cat > ~/.aws/credentials << EOF
@@ -37,7 +38,7 @@ jobs:
 
       - name: Login to Amazon ECR
         run: |
-          aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ env.ECR_REGISTRY }}
+          aws ecr get-login-password --region "${{ env.AWS_REGION }}" | docker login --username AWS --password-stdin "${{ env.ECR_REGISTRY }}"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -47,17 +48,29 @@ jobs:
         run: |
           FULL_IMAGE="${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}"
           IMAGE_TAG="${{ github.sha }}"
-          echo "Building $FULL_IMAGE:latest from context: ."
-          docker build --tag "$FULL_IMAGE:$IMAGE_TAG" --tag "$FULL_IMAGE:latest" .
+          echo "Building $FULL_IMAGE:latest from context ."
+          docker build \
+            --tag "$FULL_IMAGE:$IMAGE_TAG" \
+            --tag "$FULL_IMAGE:latest" \
+            .
           docker push "$FULL_IMAGE:$IMAGE_TAG"
           docker push "$FULL_IMAGE:latest"
           echo "full_image=$FULL_IMAGE" >> "$GITHUB_OUTPUT"
           echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
 
-      - name: Verify Docker image
+      - name: Verify Docker image (build diagnostics)
         run: |
           FULL_IMAGE="${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}"
-          docker run --rm --entrypoint sh "$FULL_IMAGE" -c "echo 'Image built successfully'; ls -la /usr/share/nginx/html/ 2>/dev/null || echo 'Checking backend...'; node --version"
+          echo "### Image verification ###"
+          docker run --rm --entrypoint sh "$FULL_IMAGE" -c "
+            echo 'Image built successfully';
+            echo '--- Frontend assets ---';
+            ls -la /usr/share/nginx/html/ 2>/dev/null || echo 'warning: frontend build output not found';
+            echo '--- Node.js version ---';
+            node --version;
+            echo '--- Backend server.js exists? ---';
+            test -f /usr/src/app/server.js && echo 'yes' || echo 'no';
+          "
 
       - name: Deploy to EC2 via SSM
         env:
@@ -65,10 +78,12 @@ jobs:
         run: |
           REGION="${{ env.AWS_REGION }}"
           INSTANCE_ID="${{ env.INSTANCE_ID }}"
-          IMAGE_URI="${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}"
+          IMAGE_URI="$FULL_IMAGE"
           ECR_REGISTRY="${{ env.ECR_REGISTRY }}"
 
-          if ! aws ec2 describe-instances --region "$REGION" --instance-ids "$INSTANCE_ID" --query "Reservations[0].Instances[0].State.Name" --output text 2>/dev/null | grep -q "running"; then
+          # Verify target instance is running; fallback to tag-based resolution
+          if ! aws ec2 describe-instances --region "$REGION" --instance-ids "$INSTANCE_ID" \
+            --query "Reservations[0].Instances[0].State.Name" --output text 2>/dev/null | grep -q "running"; then
             RESOLVED_ID=$(aws ec2 describe-instances --region "$REGION" \
               --filters "Name=tag:Name,Values=taskflow-server" "Name=instance-state-name,Values=running" \
               --query "Reservations[0].Instances[0].InstanceId" --output text 2>/dev/null || true)
@@ -76,11 +91,12 @@ jobs:
               INSTANCE_ID="$RESOLVED_ID"
               echo "Resolved running instance: $INSTANCE_ID"
             else
-              echo "ERROR: No running instance found"
+              echo "ERROR: No running EC2 instance found (tried $INSTANCE_ID and tag:taskflow-server)"
               exit 1
             fi
           fi
 
+          # Write SSM command payload and send it
           cat > /tmp/ssm-params.json << 'SSMPARAMS'
           {
             "commands": [
@@ -88,23 +104,30 @@ jobs:
               "docker pull $IMAGE_URI",
               "docker stop app || true",
               "docker rm app || true",
-              "docker run -d --restart always -p 80:80 --name app $IMAGE_URI"
+              "docker run -d --restart always -p 80:80 --name app -e MONGODB_URI=$MONGODB_URI -e JWT_SECRET=$JWT_SECRET $IMAGE_URI"
             ]
           }
           SSMPARAMS
 
-          COMMAND_ID=$(aws ssm send-command --instance-ids "$INSTANCE_ID" --region "$REGION" --document-name "AWS-RunShellScript" --parameters file:///tmp/ssm-params.json --query "Command.CommandId" --output text)
-          echo "SSM Command ID: $COMMAND_ID"
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --region "$REGION" \
+            --document-name "AWS-RunShellScript" \
+            --parameters file:///tmp/ssm-params.json \
+            --query "Command.CommandId" \
+            --output text)
 
-          sleep 10
-          aws ssm wait command-executed --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$REGION"
+          echo "SSM command sent: $COMMAND_ID"
+          echo "Waiting for command to complete..."
+          sleep 15
 
       - name: Health check
         run: |
-          sleep 10
-          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" ${{ env.PUBLIC_URL }}/api/health || true)
+          echo "Performing health check against ${{ env.PUBLIC_URL }}/api/health ..."
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 15 --max-time 30 "${{ env.PUBLIC_URL }}/api/health" || echo "000")
+          echo "HTTP response code: $HTTP_CODE"
           if [ "$HTTP_CODE" != "200" ]; then
-            echo "Health check failed at ${{ env.PUBLIC_URL }}/api/health (HTTP $HTTP_CODE)"
+            echo "Health check FAILED with HTTP $HTTP_CODE"
             exit 1
           fi
-          echo "Health check passed - HTTP 200 OK"
+          echo "Health check passed — API is responding."
