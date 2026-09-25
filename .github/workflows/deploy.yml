@@ -1,0 +1,149 @@
+name: Build & Deploy to EC2 Docker
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REGISTRY: 759204735992.dkr.ecr.ap-south-1.amazonaws.com
+  ECR_REPOSITORY: taskflow
+  INSTANCE_ID: i-00cece76df20c1e36
+  TARGET_PORT: 80
+  PUBLIC_URL: http://3.109.24.233
+
+jobs:
+  deploy:
+    name: Build, Push and Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup AWS CLI
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install AWS CLI
+        run: |
+          pip install awscli
+
+      - name: Login to Amazon ECR
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          aws ecr get-login-password --region ${{ env.AWS_REGION }} | \
+            docker login --username AWS --password-stdin ${{ env.ECR_REGISTRY }}
+
+      - name: Build, tag, and push Docker image to ECR
+        id: build-image
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          FULL_IMAGE="${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}"
+          echo "Building Docker image from context ${{ github.workspace }}"
+          docker build \
+            --tag "$FULL_IMAGE:$GITHUB_SHA" \
+            --tag "$FULL_IMAGE:latest" \
+            .
+          echo "Pushing images to ECR..."
+          docker push "$FULL_IMAGE:$GITHUB_SHA"
+          docker push "$FULL_IMAGE:latest"
+          echo "full_image=$FULL_IMAGE" >> "$GITHUB_OUTPUT"
+          echo "image_uri=$FULL_IMAGE:latest" >> "$GITHUB_OUTPUT"
+          echo "Image built and pushed: $FULL_IMAGE:latest"
+
+      - name: Build diagnostics
+        run: |
+          echo "=== Docker image info ==="
+          docker images --filter "reference=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}" --format "table {{.Repository}}:{{.Tag}}\t{{.Size}}"
+          echo "=== Image URI ==="
+          echo "${{ steps.build-image.outputs.image_uri }}"
+
+      - name: Deploy to EC2 via SSM
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          REGION="${{ env.AWS_REGION }}"
+          INSTANCE_ID="${{ env.INSTANCE_ID }}"
+          ECR_REGISTRY="${{ env.ECR_REGISTRY }}"
+          REPO="${{ env.ECR_REPOSITORY }}"
+          IMAGE_URI="$ECR_REGISTRY/$REPO:latest"
+          TARGET_PORT="${{ env.TARGET_PORT }}"
+
+          # Verify instance is running; resolve by tag if needed
+          INSTANCE_STATE=$(aws ec2 describe-instances \
+            --region "$REGION" \
+            --instance-ids "$INSTANCE_ID" \
+            --query "Reservations[0].Instances[0].State.Name" \
+            --output text 2>/dev/null || echo "stopped")
+
+          if [ "$INSTANCE_STATE" != "running" ]; then
+            echo "Instance $INSTANCE_ID not running. Attempting to resolve by tag..."
+            RESOLVED_ID=$(aws ec2 describe-instances \
+              --region "$REGION" \
+              --filters "Name=tag:Name,Values=taskflow-server" "Name=instance-state-name,Values=running" \
+              --query "Reservations[0].Instances[0].InstanceId" \
+              --output text 2>/dev/null || true)
+            if [ -n "$RESOLVED_ID" ] && [ "$RESOLVED_ID" != "None" ]; then
+              INSTANCE_ID="$RESOLVED_ID"
+              echo "Resolved to running instance: $INSTANCE_ID"
+            else
+              echo "No running instance found. Starting instance $INSTANCE_ID..."
+              aws ec2 start-instances --instance-ids "$INSTANCE_ID" --region "$REGION"
+              aws ec2 wait instance-running --instance-ids "$INSTANCE_ID" --region "$REGION"
+              echo "Instance started: $INSTANCE_ID"
+            fi
+          fi
+
+          echo "Deploying to instance: $INSTANCE_ID"
+
+          # Write SSM commands to file to avoid shell parsing issues
+          cat > /tmp/ssm-params.json << 'SSMPARAMS'
+          {
+            "commands": [
+              "aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ECR_REGISTRY",
+              "docker pull $IMAGE_URI",
+              "docker stop app || true",
+              "docker rm app || true",
+              "docker run -d --restart always -p 80:80 --name app $IMAGE_URI"
+            ]
+          }
+          SSMPARAMS
+
+          # Replace variables in the file
+          sed -i "s|\$REGION|$REGION|g" /tmp/ssm-params.json
+          sed -i "s|\$ECR_REGISTRY|$ECR_REGISTRY|g" /tmp/ssm-params.json
+          sed -i "s|\$IMAGE_URI|$IMAGE_URI|g" /tmp/ssm-params.json
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --region "$REGION" \
+            --document-name "AWS-RunShellScript" \
+            --parameters file:///tmp/ssm-params.json \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "SSM command sent: $COMMAND_ID"
+          echo "Waiting for command to complete..."
+          aws ssm wait command-executed --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$REGION"
+          echo "SSM command completed successfully"
+
+      - name: Health check
+        run: |
+          echo "Performing health check on ${{ env.PUBLIC_URL }}"
+          sleep 10
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "${{ env.PUBLIC_URL }}" || echo "000")
+          echo "HTTP Status: $HTTP_STATUS"
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "Health check failed! Expected 200, got $HTTP_STATUS"
+            exit 1
+          fi
+          echo "Health check passed - application is running"
