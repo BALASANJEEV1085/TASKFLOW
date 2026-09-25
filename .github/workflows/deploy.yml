@@ -23,7 +23,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup AWS CLI
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -96,16 +96,14 @@ jobs:
               INSTANCE_ID="$RESOLVED_ID"
               echo "Resolved to running instance: $INSTANCE_ID"
             else
-              echo "No running instance found. Starting instance $INSTANCE_ID..."
-              aws ec2 start-instances --instance-ids "$INSTANCE_ID" --region "$REGION"
+              echo "No running instance found. Starting instance..."
+              aws ec2 start-instances --instance-ids "$INSTANCE_ID" --region "$REGION" > /dev/null
               aws ec2 wait instance-running --instance-ids "$INSTANCE_ID" --region "$REGION"
-              echo "Instance started: $INSTANCE_ID"
+              echo "Instance $INSTANCE_ID is now running"
             fi
           fi
 
-          echo "Deploying to instance: $INSTANCE_ID"
-
-          # Write SSM commands to file to avoid shell parsing issues
+          # Write SSM command to JSON file to avoid shell parsing bugs
           cat > /tmp/ssm-params.json << 'SSMPARAMS'
           {
             "commands": [
@@ -118,32 +116,71 @@ jobs:
           }
           SSMPARAMS
 
-          # Replace variables in the file
-          sed -i "s|\$REGION|$REGION|g" /tmp/ssm-params.json
-          sed -i "s|\$ECR_REGISTRY|$ECR_REGISTRY|g" /tmp/ssm-params.json
-          sed -i "s|\$IMAGE_URI|$IMAGE_URI|g" /tmp/ssm-params.json
+          # Inject runtime variables into the JSON using jq
+          apt-get update -qq && apt-get install -y -qq jq > /dev/null 2>&1
+          jq --arg REGION "$REGION" \
+             --arg ECR_REGISTRY "$ECR_REGISTRY" \
+             --arg IMAGE_URI "$IMAGE_URI" \
+             '.commands[0] |= gsub("\\$REGION"; $REGION) | .commands[0] |= gsub("\\$ECR_REGISTRY"; $ECR_REGISTRY) | .commands[1] |= gsub("\\$IMAGE_URI"; $IMAGE_URI) | .commands[4] |= gsub("\\$IMAGE_URI"; $IMAGE_URI)' \
+             /tmp/ssm-params.json > /tmp/ssm-params-resolved.json
 
+          echo "Sending SSM command to $INSTANCE_ID..."
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "$INSTANCE_ID" \
             --region "$REGION" \
             --document-name "AWS-RunShellScript" \
-            --parameters file:///tmp/ssm-params.json \
+            --parameters file:///tmp/ssm-params-resolved.json \
             --query "Command.CommandId" \
             --output text)
 
-          echo "SSM command sent: $COMMAND_ID"
-          echo "Waiting for command to complete..."
-          aws ssm wait command-executed --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$REGION"
-          echo "SSM command completed successfully"
+          echo "SSM Command ID: $COMMAND_ID"
+
+          # Wait for command to complete
+          for i in $(seq 1 30); do
+            STATUS=$(aws ssm list-command-invocations \
+              --region "$REGION" \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --query "CommandInvocations[0].Status" \
+              --output text 2>/dev/null || echo "Pending")
+            echo "Command status: $STATUS"
+            if [ "$STATUS" = "Success" ] || [ "$STATUS" = "Failed" ] || [ "$STATUS" = "TimedOut" ]; then
+              break
+            fi
+            sleep 10
+          done
+
+          # Show output
+          aws ssm list-command-invocations \
+            --region "$REGION" \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --details \
+            --query "CommandInvocations[0].CommandPlugins[0].Output" \
+            --output text || echo "No output available"
+
+          if [ "$STATUS" != "Success" ]; then
+            echo "SSM command failed with status: $STATUS"
+            exit 1
+          fi
+
+          echo "Deployment completed successfully"
 
       - name: Health check
         run: |
-          echo "Performing health check on ${{ env.PUBLIC_URL }}"
-          sleep 10
-          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "${{ env.PUBLIC_URL }}" || echo "000")
-          echo "HTTP Status: $HTTP_STATUS"
-          if [ "$HTTP_STATUS" != "200" ]; then
-            echo "Health check failed! Expected 200, got $HTTP_STATUS"
-            exit 1
-          fi
-          echo "Health check passed - application is running"
+          echo "Waiting for application to start..."
+          sleep 15
+
+          for i in $(seq 1 12); do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" ${{ env.PUBLIC_URL }} || echo "000")
+            echo "Attempt $i: HTTP status $HTTP_CODE"
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "Health check passed! Application is running at ${{ env.PUBLIC_URL }}"
+              exit 0
+            fi
+            sleep 10
+          done
+
+          echo "Health check failed after 12 attempts"
+          curl -v ${{ env.PUBLIC_URL }} || true
+          exit 1
