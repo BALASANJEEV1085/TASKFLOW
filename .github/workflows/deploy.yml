@@ -22,6 +22,20 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Configure AWS credentials
+        run: |
+          mkdir -p ~/.aws
+          cat > ~/.aws/credentials << EOF
+          [default]
+          aws_access_key_id = ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws_secret_access_key = ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          EOF
+          cat > ~/.aws/config << EOF
+          [default]
+          region = ${{ env.AWS_REGION }}
+          output = json
+          EOF
+
       - name: Login to Amazon ECR
         run: |
           aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ env.ECR_REGISTRY }}
@@ -37,6 +51,11 @@ jobs:
           docker push "$FULL_IMAGE:latest"
           echo "full_image=$FULL_IMAGE" >> "$GITHUB_OUTPUT"
           echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Verify Docker image
+        run: |
+          FULL_IMAGE="${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}"
+          docker run --rm --entrypoint sh "$FULL_IMAGE" -c "echo 'Image built successfully'; ls -la /usr/share/nginx/html/ 2>/dev/null || echo 'Checking backend...'; node --version"
 
       - name: Deploy to EC2 via SSM
         env:
@@ -93,32 +112,57 @@ jobs:
               --command-id "$COMMAND_ID" \
               --instance-id "$INSTANCE_ID" \
               --region "$REGION" \
+              --details \
               --query "CommandInvocations[0].Status" \
               --output text 2>/dev/null || echo "Pending")
-            echo "Command status: $STATUS"
+            
             if [ "$STATUS" = "Success" ]; then
               echo "Deployment completed successfully"
               break
-            elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "TimedOut" ]; then
-              echo "Deployment failed"
+            elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "TimedOut" ] || [ "$STATUS" = "Cancelled" ]; then
+              echo "Deployment failed with status: $STATUS"
+              aws ssm list-command-invocations \
+                --command-id "$COMMAND_ID" \
+                --instance-id "$INSTANCE_ID" \
+                --region "$REGION" \
+                --details \
+                --query "CommandInvocations[0].CommandPlugins[0].Output" \
+                --output text
               exit 1
             fi
             sleep 10
           done
 
-      - name: Health Check
+      - name: Health check
         run: |
-          echo "Waiting for container to be healthy..."
-          sleep 15
+          URL="${{ env.PUBLIC_URL }}"
+          echo "Waiting for application to become ready at $URL..."
           for i in $(seq 1 12); do
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "${{ env.PUBLIC_URL }}/api/health" || echo "000")
-            echo "Attempt $i: HTTP $HTTP_CODE"
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$URL" || echo "000")
             if [ "$HTTP_CODE" = "200" ]; then
-              echo "Health check passed"
-              echo "Application is live at ${{ env.PUBLIC_URL }}"
+              echo "Health check passed! Application is running at $URL"
               exit 0
             fi
+            echo "Attempt $i: HTTP $HTTP_CODE, retrying in 10s..."
             sleep 10
           done
-          echo "Health check failed after all attempts"
+          echo "Health check failed after 120 seconds"
+          curl -v "$URL" || true
+          exit 1
+
+      - name: Verify API endpoint
+        run: |
+          URL="${{ env.PUBLIC_URL }}"
+          echo "Verifying API health endpoint..."
+          for i in $(seq 1 6); do
+            RESPONSE=$(curl -s "$URL/api/health" || echo "API not ready")
+            if echo "$RESPONSE" | grep -q "Server is running"; then
+              echo "API is healthy: $RESPONSE"
+              exit 0
+            fi
+            echo "Attempt $i: API not ready, retrying in 10s..."
+            sleep 10
+          done
+          echo "API verification failed"
+          curl -v "$URL/api/health" || true
           exit 1
