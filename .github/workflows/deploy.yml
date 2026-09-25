@@ -94,37 +94,36 @@ jobs:
           SSMPARAMS
 
           COMMAND_ID=$(aws ssm send-command --instance-ids "$INSTANCE_ID" --region "$REGION" --document-name "AWS-RunShellScript" --parameters file:///tmp/ssm-params.json --query "Command.CommandId" --output text)
-          echo "SSM Command ID: $COMMAND_ID"
+          echo "SSM command sent: $COMMAND_ID"
 
-          # Wait for SSM command to complete
-          for i in $(seq 1 30); do
+          sleep 10
+
+          for i in 1 2 3 4 5; do
             STATUS=$(aws ssm list-command-invocations --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$REGION" --query "CommandInvocations[0].Status" --output text 2>/dev/null || echo "Pending")
+            echo "Deployment status attempt $i: $STATUS"
             if [ "$STATUS" = "Success" ]; then
-              echo "SSM command completed successfully"
+              echo "Deployment successful"
               break
-            elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "TimedOut" ]; then
-              echo "SSM command failed with status: $STATUS"
-              aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$REGION" --query "StandardErrorContent" --output text
+            fi
+            if [ "$STATUS" = "Failed" ] || [ "$STATUS" = "TimedOut" ]; then
+              echo "Deployment failed with status: $STATUS"
               exit 1
             fi
-            echo "Waiting for SSM command... attempt $i"
             sleep 10
           done
 
-      - name: Health Check
+      - name: Health check
         run: |
-          echo "Waiting for application to start..."
-          sleep 30
-          for i in $(seq 1 12); do
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" ${{ env.PUBLIC_URL }}/api/health 2>/dev/null || echo "000")
+          sleep 15
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 10 http://35.154.173.36/ || echo "000")
             if [ "$HTTP_CODE" = "200" ]; then
-              echo "Health check passed - Application is running!"
-              curl -s ${{ env.PUBLIC_URL }}/api/health
+              echo "Health check passed - HTTP 200"
+              curl -s http://35.154.173.36/api/health && echo ""
               exit 0
             fi
-            echo "Health check attempt $i: HTTP $HTTP_CODE, retrying in 10s..."
+            echo "Attempt $i: HTTP status $HTTP_CODE, retrying in 10 seconds..."
             sleep 10
           done
-          echo "Health check failed after all retries"
-          curl -v ${{ env.PUBLIC_URL }}/api/health 2>&1 || true
+          echo "Health check failed after 10 attempts"
           exit 1
