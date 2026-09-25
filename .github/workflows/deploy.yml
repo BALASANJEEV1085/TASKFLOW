@@ -104,55 +104,82 @@ jobs:
           cat > /tmp/ssm-params.json << 'SSMPARAMS'
           {
             "commands": [
-              "aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ECR_REGISTRY",
-              "docker pull $IMAGE_URI",
+              "aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin 759204735992.dkr.ecr.ap-south-1.amazonaws.com",
+              "docker pull IMAGE_PLACEHOLDER",
               "docker stop app || true",
               "docker rm app || true",
-              "docker run -d --restart always -p 80:80 -e JWT_SECRET=$JWT_SECRET -e MONGODB_URI='$MONGODB_URI' --name app $IMAGE_URI"
+              "docker run -d --restart always -p 80:80 --name app -e JWT_SECRET=JWT_PLACEHOLDER -e MONGODB_URI=MONGODB_PLACEHOLDER IMAGE_PLACEHOLDER"
             ]
           }
           SSMPARAMS
 
-          echo "SSM parameters file created"
+          sed -i "s|IMAGE_PLACEHOLDER|$IMAGE_URI|g" /tmp/ssm-params.json
+          sed -i "s|JWT_PLACEHOLDER|$JWT_SECRET|g" /tmp/ssm-params.json
+          sed -i "s|MONGODB_PLACEHOLDER|$MONGODB_URI|g" /tmp/ssm-params.json
+
+          echo "SSM parameters prepared"
 
       - name: Deploy to EC2 via SSM
         run: |
-          REGION="${{ env.AWS_REGION }}"
-          INSTANCE_ID="${{ env.INSTANCE_ID }}"
-
           COMMAND_ID=$(aws ssm send-command \
-            --instance-ids "${INSTANCE_ID}" \
-            --region "${REGION}" \
+            --instance-ids "${{ env.INSTANCE_ID }}" \
+            --region "${{ env.AWS_REGION }}" \
             --document-name "AWS-RunShellScript" \
             --parameters file:///tmp/ssm-params.json \
             --query "Command.CommandId" \
             --output text)
 
-          echo "SSM command sent: ${COMMAND_ID}"
+          echo "SSM Command ID: ${COMMAND_ID}"
 
+          TIMEOUT=120
+          ELAPSED=0
+          while [ "$ELAPSED" -lt "$TIMEOUT" ]; do
+            STATUS=$(aws ssm list-command-invocations \
+              --command-id "$COMMAND_ID" \
+              --instance-id "${{ env.INSTANCE_ID }}" \
+              --region "${{ env.AWS_REGION }}" \
+              --query "CommandInvocations[0].Status" \
+              --output text)
+
+            if [ "$STATUS" = "Success" ]; then
+              echo "Deployment successful!"
+              break
+            elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "TimedOut" ]; then
+              echo "Deployment failed with status: $STATUS"
+              aws ssm get-command-invocation \
+                --command-id "$COMMAND_ID" \
+                --instance-id "${{ env.INSTANCE_ID }}" \
+                --region "${{ env.AWS_REGION }}" \
+                --query "StandardOutputContent" \
+                --output text
+              exit 1
+            fi
+
+            sleep 10
+            ELAPSED=$((ELAPSED + 10))
+          done
+
+      - name: Verify deployment
+        run: |
+          echo "Waiting for application to start..."
           sleep 15
 
-          aws ssm wait command-executed \
-            --command-id "${COMMAND_ID}" \
-            --instance-id "${INSTANCE_ID}" \
-            --region "${REGION}"
+          for i in $(seq 1 6); do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 ${{ env.PUBLIC_URL }}/api/health || echo "000")
+            echo "Attempt $i: HTTP status code $HTTP_CODE"
 
-          echo "SSM command completed successfully"
-
-      - name: Health check
-        run: |
-          echo "Waiting for application to be ready..."
-          sleep 10
-          for i in {1..30}; do
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://3.109.24.233/api/health || echo "000")
             if [ "$HTTP_CODE" = "200" ]; then
-              echo "Application is healthy! HTTP 200 received."
-              curl -s http://3.109.24.233/api/health
+              echo "Health check passed! Application is running."
+              curl -s --max-time 10 ${{ env.PUBLIC_URL }}/api/health | head -c 500
+              echo ""
               exit 0
             fi
-            echo "Attempt $i: HTTP $HTTP_CODE, retrying in 5 seconds..."
-            sleep 5
+
+            if [ "$i" -lt 6 ]; then
+              echo "Waiting 10 seconds before retry..."
+              sleep 10
+            fi
           done
-          echo "Health check failed after 30 attempts"
-          curl -v http://3.109.24.233/api/health 2>&1 || true
+
+          echo "Health check failed after multiple retries"
           exit 1
