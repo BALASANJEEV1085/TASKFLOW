@@ -94,36 +94,17 @@ jobs:
           SSMPARAMS
 
           COMMAND_ID=$(aws ssm send-command --instance-ids "$INSTANCE_ID" --region "$REGION" --document-name "AWS-RunShellScript" --parameters file:///tmp/ssm-params.json --query "Command.CommandId" --output text)
-          echo "SSM command sent: $COMMAND_ID"
+          echo "SSM Command ID: $COMMAND_ID"
 
           sleep 10
-
-          for i in 1 2 3 4 5; do
-            STATUS=$(aws ssm list-command-invocations --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$REGION" --query "CommandInvocations[0].Status" --output text 2>/dev/null || echo "Pending")
-            echo "Deployment status attempt $i: $STATUS"
-            if [ "$STATUS" = "Success" ]; then
-              echo "Deployment successful"
-              break
-            fi
-            if [ "$STATUS" = "Failed" ] || [ "$STATUS" = "TimedOut" ]; then
-              echo "Deployment failed with status: $STATUS"
-              exit 1
-            fi
-            sleep 10
-          done
+          aws ssm wait command-executed --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$REGION"
 
       - name: Health check
         run: |
-          sleep 15
-          for i in 1 2 3 4 5 6 7 8 9 10; do
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 10 http://35.154.173.36/ || echo "000")
-            if [ "$HTTP_CODE" = "200" ]; then
-              echo "Health check passed - HTTP 200"
-              curl -s http://35.154.173.36/api/health && echo ""
-              exit 0
-            fi
-            echo "Attempt $i: HTTP status $HTTP_CODE, retrying in 10 seconds..."
-            sleep 10
-          done
-          echo "Health check failed after 10 attempts"
-          exit 1
+          sleep 10
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" ${{ env.PUBLIC_URL }}/api/health || true)
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "Health check failed at ${{ env.PUBLIC_URL }}/api/health (HTTP $HTTP_CODE)"
+            exit 1
+          fi
+          echo "Health check passed - HTTP 200 OK"
