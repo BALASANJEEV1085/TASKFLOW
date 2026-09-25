@@ -94,16 +94,14 @@ jobs:
               --output text 2>/dev/null || true)
             if [ -n "$RESOLVED_ID" ] && [ "$RESOLVED_ID" != "None" ]; then
               INSTANCE_ID="$RESOLVED_ID"
-              echo "Resolved to running instance: $INSTANCE_ID"
+              echo "Resolved to instance $INSTANCE_ID"
             else
-              echo "No running instance found. Starting instance..."
-              aws ec2 start-instances --instance-ids "$INSTANCE_ID" --region "$REGION" > /dev/null
-              aws ec2 wait instance-running --instance-ids "$INSTANCE_ID" --region "$REGION"
-              echo "Instance $INSTANCE_ID is now running"
+              echo "ERROR: Could not find a running instance. Aborting deployment."
+              exit 1
             fi
           fi
 
-          # Write SSM command to JSON file to avoid shell parsing bugs
+          # Write SSM commands to a JSON file to avoid shell parsing bugs
           cat > /tmp/ssm-params.json << 'SSMPARAMS'
           {
             "commands": [
@@ -116,20 +114,17 @@ jobs:
           }
           SSMPARAMS
 
-          # Inject runtime variables into the JSON using jq
-          apt-get update -qq && apt-get install -y -qq jq > /dev/null 2>&1
-          jq --arg REGION "$REGION" \
-             --arg ECR_REGISTRY "$ECR_REGISTRY" \
-             --arg IMAGE_URI "$IMAGE_URI" \
-             '.commands[0] |= gsub("\\$REGION"; $REGION) | .commands[0] |= gsub("\\$ECR_REGISTRY"; $ECR_REGISTRY) | .commands[1] |= gsub("\\$IMAGE_URI"; $IMAGE_URI) | .commands[4] |= gsub("\\$IMAGE_URI"; $IMAGE_URI)' \
-             /tmp/ssm-params.json > /tmp/ssm-params-resolved.json
+          # Substitute environment variables in the JSON file
+          sed -i "s|\$REGION|$REGION|g; s|\$ECR_REGISTRY|$ECR_REGISTRY|g; s|\$IMAGE_URI|$IMAGE_URI|g" /tmp/ssm-params.json
 
-          echo "Sending SSM command to $INSTANCE_ID..."
+          echo "SSM params:"
+          cat /tmp/ssm-params.json
+
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "$INSTANCE_ID" \
             --region "$REGION" \
             --document-name "AWS-RunShellScript" \
-            --parameters file:///tmp/ssm-params-resolved.json \
+            --parameters file:///tmp/ssm-params.json \
             --query "Command.CommandId" \
             --output text)
 
@@ -138,49 +133,51 @@ jobs:
           # Wait for command to complete
           for i in $(seq 1 30); do
             STATUS=$(aws ssm list-command-invocations \
-              --region "$REGION" \
               --command-id "$COMMAND_ID" \
               --instance-id "$INSTANCE_ID" \
+              --region "$REGION" \
               --query "CommandInvocations[0].Status" \
               --output text 2>/dev/null || echo "Pending")
+            
             echo "Command status: $STATUS"
-            if [ "$STATUS" = "Success" ] || [ "$STATUS" = "Failed" ] || [ "$STATUS" = "TimedOut" ]; then
+            
+            if [ "$STATUS" = "Success" ]; then
+              echo "SSM command completed successfully"
               break
+            elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "TimedOut" ]; then
+              echo "SSM command failed with status: $STATUS"
+              # Get error details
+              aws ssm get-command-invocation \
+                --command-id "$COMMAND_ID" \
+                --instance-id "$INSTANCE_ID" \
+                --region "$REGION" \
+                --query "StandardErrorContent" \
+                --output text
+              exit 1
             fi
-            sleep 10
+            
+            if [ $i -eq 30 ]; then
+              echo "Timeout waiting for SSM command to complete"
+              exit 1
+            fi
+            
+            sleep 5
           done
-
-          # Show output
-          aws ssm list-command-invocations \
-            --region "$REGION" \
-            --command-id "$COMMAND_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --details \
-            --query "CommandInvocations[0].CommandPlugins[0].Output" \
-            --output text || echo "No output available"
-
-          if [ "$STATUS" != "Success" ]; then
-            echo "SSM command failed with status: $STATUS"
-            exit 1
-          fi
-
-          echo "Deployment completed successfully"
 
       - name: Health check
         run: |
           echo "Waiting for application to start..."
-          sleep 15
-
           for i in $(seq 1 12); do
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" ${{ env.PUBLIC_URL }} || echo "000")
-            echo "Attempt $i: HTTP status $HTTP_CODE"
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "${{ env.PUBLIC_URL }}/api/health" || true)
             if [ "$HTTP_CODE" = "200" ]; then
-              echo "Health check passed! Application is running at ${{ env.PUBLIC_URL }}"
+              echo "Health check passed! Application is running."
+              curl -s "${{ env.PUBLIC_URL }}/api/health"
               exit 0
             fi
-            sleep 10
+            echo "Attempt $i: HTTP status $HTTP_CODE - waiting..."
+            sleep 5
           done
-
+          
           echo "Health check failed after 12 attempts"
-          curl -v ${{ env.PUBLIC_URL }} || true
+          curl -v "${{ env.PUBLIC_URL }}/api/health" || true
           exit 1
