@@ -7,8 +7,8 @@ on:
 
 env:
   AWS_REGION: ap-south-1
-  ECR_REPOSITORY: taskflow
   ECR_REGISTRY: 759204735992.dkr.ecr.ap-south-1.amazonaws.com
+  ECR_REPOSITORY: taskflow
   INSTANCE_ID: i-023481b86999aeb33
   CONTAINER_PORT: 80
   PUBLIC_URL: http://35.154.173.36
@@ -22,7 +22,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
+      - name: Configure AWS CLI
         run: |
           mkdir -p ~/.aws
           cat > ~/.aws/credentials << EOF
@@ -39,6 +39,9 @@ jobs:
       - name: Login to Amazon ECR
         run: |
           aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ env.ECR_REGISTRY }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Build, tag, and push Docker image to ECR
         id: build-image
@@ -66,7 +69,6 @@ jobs:
           IMAGE_URI="$FULL_IMAGE"
           ECR_REGISTRY="${{ env.ECR_REGISTRY }}"
 
-          # Use resolved instance if provided instance is not running
           if ! aws ec2 describe-instances --region "$REGION" --instance-ids "$INSTANCE_ID" --query "Reservations[0].Instances[0].State.Name" --output text 2>/dev/null | grep -q "running"; then
             RESOLVED_ID=$(aws ec2 describe-instances --region "$REGION" \
               --filters "Name=tag:Name,Values=taskflow-server" "Name=instance-state-name,Values=running" \
@@ -88,12 +90,10 @@ jobs:
               "docker stop app || true",
               "docker rm app || true",
               "docker run -d --restart always -p 80:80 --name app $IMAGE_URI"
-            ],
-            "executionTimeout": ["300"]
+            ]
           }
           SSMPARAMS
 
-          # Replace variables inside the JSON since shell heredoc doesn't expand
           sed -i "s|\$REGION|$REGION|g; s|\$ECR_REGISTRY|$ECR_REGISTRY|g; s|\$IMAGE_URI|$IMAGE_URI|g" /tmp/ssm-params.json
 
           COMMAND_ID=$(aws ssm send-command \
@@ -104,9 +104,8 @@ jobs:
             --query "Command.CommandId" \
             --output text)
 
-          echo "SSM command sent: $COMMAND_ID"
+          echo "SSM Command ID: $COMMAND_ID"
 
-          # Wait for command to complete
           for i in $(seq 1 30); do
             STATUS=$(aws ssm list-command-invocations \
               --command-id "$COMMAND_ID" \
@@ -119,7 +118,7 @@ jobs:
             if [ "$STATUS" = "Success" ]; then
               echo "Deployment completed successfully"
               break
-            elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "TimedOut" ] || [ "$STATUS" = "Cancelled" ]; then
+            elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "TimedOut" ]; then
               echo "Deployment failed with status: $STATUS"
               aws ssm list-command-invocations \
                 --command-id "$COMMAND_ID" \
@@ -133,36 +132,19 @@ jobs:
             sleep 10
           done
 
-      - name: Health check
+      - name: Health Check
         run: |
-          URL="${{ env.PUBLIC_URL }}"
-          echo "Waiting for application to become ready at $URL..."
-          for i in $(seq 1 12); do
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$URL" || echo "000")
+          echo "Waiting for application to be ready..."
+          for i in $(seq 1 30); do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 10 "${{ env.PUBLIC_URL }}/api/health" 2>/dev/null || echo "000")
             if [ "$HTTP_CODE" = "200" ]; then
-              echo "Health check passed! Application is running at $URL"
+              echo "Application is healthy! HTTP Status: $HTTP_CODE"
+              curl -s "${{ env.PUBLIC_URL }}/api/health"
               exit 0
             fi
-            echo "Attempt $i: HTTP $HTTP_CODE, retrying in 10s..."
+            echo "Attempt $i: HTTP Status $HTTP_CODE, retrying in 10 seconds..."
             sleep 10
           done
-          echo "Health check failed after 120 seconds"
-          curl -v "$URL" || true
-          exit 1
-
-      - name: Verify API endpoint
-        run: |
-          URL="${{ env.PUBLIC_URL }}"
-          echo "Verifying API health endpoint..."
-          for i in $(seq 1 6); do
-            RESPONSE=$(curl -s "$URL/api/health" || echo "API not ready")
-            if echo "$RESPONSE" | grep -q "Server is running"; then
-              echo "API is healthy: $RESPONSE"
-              exit 0
-            fi
-            echo "Attempt $i: API not ready, retrying in 10s..."
-            sleep 10
-          done
-          echo "API verification failed"
-          curl -v "$URL/api/health" || true
+          echo "Health check failed after 30 attempts"
+          curl -v "${{ env.PUBLIC_URL }}/api/health" 2>&1 || true
           exit 1
